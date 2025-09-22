@@ -1,246 +1,176 @@
-# app.py
 import streamlit as st
 import librosa
-import librosa.display  # needed for specshow
 import numpy as np
 import matplotlib.pyplot as plt
+import os
+import shutil
+from pathlib import Path
 import pandas as pd
 import subprocess
-import shutil
-import os
-from io import BytesIO
-from pathlib import Path
-from tempfile import TemporaryDirectory
 
+# Set page config
 st.set_page_config(page_title="Audio Voice Sample Analyzer", layout="wide")
 
-# ---------- Utilities ----------
+st.title("🎙️ Audio Voice Sample Analyzer")
+st.markdown("Upload a video to extract and analyze its audio voice characteristics. Ideal for calls, pitches, or podcasts.")
 
-def _check_ffmpeg():
-    """Ensure ffmpeg & ffprobe exist on the PATH."""
-    if shutil.which("ffmpeg") is None or shutil.which("ffprobe") is None:
-        raise RuntimeError(
-            "ffmpeg/ffprobe not found. On Streamlit Cloud, add a `packages.txt` file with:\n\nffmpeg"
+# Create temporary directory
+temp_dir = "temp"
+os.makedirs(temp_dir, exist_ok=True)
+
+def analyze_audio_from_video(video_file):
+    try:
+        # Set up paths
+        video_path = os.path.join(temp_dir, "uploaded_video.mp4")
+        audio_path = os.path.join(temp_dir, "temp_audio.wav")
+
+        # Save uploaded file
+        with open(video_path, "wb") as f:
+            f.write(video_file.read())
+
+        # Step 1: Extract audio from video and get clip stats
+        result = subprocess.run(
+            ['ffmpeg', '-i', video_path, '-vn', '-acodec', 'pcm_s16le', audio_path],
+            capture_output=True, text=True
         )
+        if result.returncode != 0:
+            raise Exception(f"FFmpeg error: {result.stderr}")
 
-def _save_plot_to_png_bytes():
-    """Save current Matplotlib figure to PNG bytes and close it."""
-    buf = BytesIO()
-    plt.tight_layout()
-    plt.savefig(buf, format="png", dpi=200, bbox_inches="tight")
-    plt.close()
-    buf.seek(0)
-    return buf
-
-def _extract_audio_ffmpeg(video_path: str, audio_path: str):
-    subprocess.run(
-        ["ffmpeg", "-y", "-i", video_path, "-vn", "-acodec", "pcm_s16le", audio_path],
-        check=True,
-        timeout=60,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=False,
-    )
-
-def _probe_duration(video_path: str) -> float:
-    probe = subprocess.run(
-        [
-            "ffprobe", "-v", "error", "-show_entries", "format=duration",
-            "-of", "default=noprint_wrappers=1:nokey=1", video_path,
-        ],
-        text=True, capture_output=True
-    )
-    return float(probe.stdout.strip()) if probe.stdout.strip() else 0.0
-
-# ---------- Core analysis ----------
-
-def analyze_audio_from_video(uploaded_file) -> dict:
-    """
-    Returns a dict containing:
-      clip_stats: str
-      summary: str
-      performance_plot_png: bytes
-      extremes_table_df: pd.DataFrame
-      tech_plot_png: bytes
-    """
-    _check_ffmpeg()
-
-    with TemporaryDirectory() as tmpdir:
-        tmpdir = Path(tmpdir)
-        video_path = tmpdir / "uploaded_video.mp4"
-        audio_path = tmpdir / "temp_audio.wav"
-
-        # Persist uploaded file to disk
-        video_path.write_bytes(uploaded_file.read())
-
-        # 1) Extract audio
-        _extract_audio_ffmpeg(str(video_path), str(audio_path))
-
-        # Clip stats
-        duration_sec = _probe_duration(str(video_path))
-        minutes, seconds = divmod(int(duration_sec), 60)
-        file_size_kb = video_path.stat().st_size / 1024.0
-        size_value = file_size_kb
+        # Get video duration and size
+        probe = subprocess.run(
+            ['ffprobe', '-v', 'error', '-show_entries', 'format=duration',
+             '-of', 'default=noprint_wrappers=1:nokey=1', video_path],
+            text=True, capture_output=True
+        )
+        duration = float(probe.stdout.strip()) if probe.stdout.strip() else 0
+        minutes, seconds = divmod(duration, 60)
+        file_size = os.path.getsize(video_path) / 1024  # KB
         size_unit = "KB"
-        if file_size_kb > 1024:
-            size_value = file_size_kb / 1024.0
+        if file_size > 1024:
+            file_size /= 1024
             size_unit = "MB"
-        clip_stats = (
-            f"Clip Statistics:\n"
-            f"- Duration: {minutes}m {seconds}s\n"
-            f"- File Size: {size_value:.2f} {size_unit}"
-        )
+        clip_stats = f"Clip Statistics:\n- Duration: {int(minutes)}m {int(seconds)}s\n- File Size: {file_size:.2f} {size_unit}"
 
-        # 2) Analyze audio features
-        # Use native sampling rate to avoid resampling artifacts
-        y, sr = librosa.load(str(audio_path), sr=None)
-        total_duration = len(y) / sr if sr else 0.0
+        # Step 2: Analyze audio features
+        y, sr = librosa.load(audio_path)
+        duration_sec = len(y) / sr
 
-        # Pitch via piptrack (2D: n_freqs x n_frames)
-        pitches, mags = librosa.piptrack(y=y, sr=sr)
-        positive = pitches > 0
-        pitch_vals = pitches[positive]
-        pitch_mean = float(np.mean(pitch_vals)) if pitch_vals.size else 0.0
-        pitch_std = float(np.std(pitch_vals)) if pitch_vals.size else 0.0
-        # Rough male/female typical range pivot like your original logic
+        # Pitch analysis
+        pitch, _ = librosa.piptrack(y=y, sr=sr)
+        pitch_vals = pitch[pitch > 0]
+        pitch_mean = np.mean(pitch_vals) if pitch_vals.size else 0
+        pitch_std = np.std(pitch_vals) if pitch_vals.size else 0
         typical_pitch_range = 150 if pitch_mean > 150 else 100
 
         # Energy (RMS)
-        rms = librosa.feature.rms(y=y)[0]
-        energy = float(np.mean(rms)) if rms.size else 0.0
+        energy = np.mean(librosa.feature.rms(y=y)[0])
         ideal_energy_range = 0.15
 
-        # Speaking rate approximation (using non-silent segments)
-        # librosa.effects.split returns non-silent intervals
-        nonsilent_intervals = librosa.effects.split(y, top_db=20)
-        speaking_rate = (len(nonsilent_intervals) / total_duration * 60.0) if total_duration > 0 else 0.0
+        # Speaking rate (approximation)
+        silent_intervals = librosa.effects.split(y, top_db=20)
+        speaking_rate = len(silent_intervals) / duration_sec * 60 if duration_sec > 0 else 0
+        typical_speaking_rate = 120
 
-        typical_speaking_rate = 120.0  # wpm heuristic
+        # Pause frequency
+        pause_count = max(0, len(silent_intervals) - 1)
+        pause_frequency = pause_count / duration_sec * 60 if duration_sec > 0 else 0
 
-        # Pause frequency (gaps between non-silent intervals)
-        pause_count = max(0, len(nonsilent_intervals) - 1)
-        pause_frequency = (pause_count / total_duration * 60.0) if total_duration > 0 else 0.0
+        # Delivery Effectiveness Index
+        pitch_score = max(0, min(1, 1 - abs(pitch_mean - typical_pitch_range) / typical_pitch_range)) * 100
+        energy_score = max(0, min(1, energy / ideal_energy_range)) * 100
+        rate_score = max(0, min(1, speaking_rate / typical_speaking_rate)) * 100
+        effectiveness_index = (pitch_score + energy_score + rate_score) / 3
 
-        # Delivery Effectiveness Index (like your weights)
-        pitch_score = max(0, min(1, 1 - abs(pitch_mean - typical_pitch_range) / max(typical_pitch_range, 1))) * 100
-        energy_score = max(0, min(1, energy / max(ideal_energy_range, 1e-6))) * 100
-        rate_score = max(0, min(1, speaking_rate / max(typical_speaking_rate, 1e-6))) * 100
-        effectiveness_index = (pitch_score + energy_score + rate_score) / 3.0
+        # Step 3: Find extreme attributes with timestamps
+        time_points = np.linspace(0, duration_sec, len(y))
 
-        # 3) Extremes with timestamps
-        # Amplitude extremes (sample index -> seconds)
-        if len(y) > 0:
-            max_amp_idx = int(np.argmax(y))
-            min_amp_idx = int(np.argmin(y))
-            max_amp_time = max_amp_idx / sr
-            min_amp_time = min_amp_idx / sr
+        max_amp_idx = np.argmax(np.abs(y))
+        max_amp_time = time_points[max_amp_idx]
+        max_amp_val = y[max_amp_idx]
+
+        min_amp_idx = np.argmin(np.abs(y))
+        min_amp_time = time_points[min_amp_idx]
+        min_amp_val = y[min_amp_idx]
+
+        # Max pitch
+        max_pitch_idx = np.unravel_index(np.argmax(pitch), pitch.shape)[1] if pitch.size > 0 else 0
+        max_pitch_time = time_points[max_pitch_idx] if max_pitch_idx < len(time_points) else 0
+        max_pitch_val = np.max(pitch) if pitch.size > 0 else 0
+
+        # Min pitch (excluding silence)
+        valid_pitch = pitch[pitch > 0]
+        if valid_pitch.size > 0:
+            min_pitch_idx = np.unravel_index(np.argmin(pitch), pitch.shape)[1]
+            min_pitch_time = time_points[min_pitch_idx] if min_pitch_idx < len(time_points) else 0
+            min_pitch_val = np.min(valid_pitch)
         else:
-            max_amp_time = min_amp_time = 0.0
-
-        # Pitch extremes: summarize per-frame to map to time
-        # Take the max pitch per frame (over freq bins), then filter zeros
-        if pitches.size:
-            frame_pitch = np.max(pitches, axis=0)  # length = n_frames
-            frame_idx_max_pitch = int(np.argmax(frame_pitch)) if frame_pitch.size else 0
-            max_pitch_value = float(frame_pitch[frame_idx_max_pitch]) if frame_pitch.size else 0.0
-
-            # Min positive pitch across all frames
-            positive_frame_pitch = frame_pitch[frame_pitch > 0]
-            if positive_frame_pitch.size:
-                min_pitch_value = float(np.min(positive_frame_pitch))
-                # Frame index for the first occurrence of the min value
-                frame_idx_min_pitch = int(np.where(frame_pitch == min_pitch_value)[0][0])
-            else:
-                min_pitch_value = 0.0
-                frame_idx_min_pitch = 0
-
-            # Map frame indices to times
-            max_pitch_time = librosa.frames_to_time(frame_idx_max_pitch, sr=sr)
-            min_pitch_time = librosa.frames_to_time(frame_idx_min_pitch, sr=sr)
-        else:
-            max_pitch_value = min_pitch_value = 0.0
-            max_pitch_time = min_pitch_time = 0.0
+            min_pitch_time = 0
+            min_pitch_val = 0
 
         extremes_table = pd.DataFrame({
             'Attribute': ['Max Amplitude', 'Min Amplitude', 'Max Pitch', 'Min Pitch'],
-            'Value': [
-                f"{float(np.max(y)):.2f}" if len(y) else "0.00",
-                f"{float(np.min(y)):.2f}" if len(y) else "0.00",
-                f"{max_pitch_value:.2f} Hz",
-                f"{min_pitch_value:.2f} Hz"
-            ],
-            'Timestamp (s)': [
-                f"{max_amp_time:.2f}",
-                f"{min_amp_time:.2f}",
-                f"{max_pitch_time:.2f}",
-                f"{min_pitch_time:.2f}"
-            ]
+            'Value': [f"{max_amp_val:.2f}", f"{min_amp_val:.2f}", f"{max_pitch_val:.2f} Hz", f"{min_pitch_val:.2f} Hz"],
+            'Timestamp (s)': [f"{max_amp_time:.2f}", f"{min_amp_time:.2f}", f"{max_pitch_time:.2f}", f"{min_pitch_time:.2f}"]
         })
 
-        # 4) Visualizations
+        # Step 4: Visualize results
 
-        # 4a) Performance vs Benchmarks (relative bars)
+        # Performance Plot
         metrics = ['Pitch (Hz)', 'Energy', 'Speaking Rate (wpm)']
         values = [pitch_mean, energy, speaking_rate]
-        ideals = [float(typical_pitch_range), float(ideal_energy_range), float(typical_speaking_rate)]
-        relatives = [v / i if i != 0 else 0 for v, i in zip(values, ideals)]
+        ideal_values = [typical_pitch_range, ideal_energy_range, typical_speaking_rate]
+        relative_values = [v / i if i != 0 else 0 for v, i in zip(values, ideal_values)]
 
-        plt.figure(figsize=(8, 4.5))
-        # simple color coding like your original
-        colors = ['green' if v >= 0.8 else 'yellow' if v >= 0.5 else 'red' for v in relatives]
-        bars = plt.bar(metrics, relatives, color=colors)
-        plt.axhline(y=1.0, color='b', linestyle='--', label='Ideal Level')
-        plt.title('Voice Characteristics vs. Ideal Benchmarks (Relative)')
-        plt.ylabel('Relative Performance (Ideal = 1.0)')
-        plt.ylim(0, max(1.2, max(relatives + [1.0]) + 0.1))
-        plt.legend()
-        performance_plot_png = _save_plot_to_png_bytes()
+        colors = ['green' if v >= 0.8 else 'yellow' if v >= 0.5 else 'red' for v in relative_values]
 
-        # 4b) Waveform + Spectrogram with ideal zones
-        # Waveform (first 10% for detail, as in your code)
-        plt.figure(figsize=(10, 6))
-        # Top plot: waveform
-        plt.subplot(2, 1, 1)
-        if len(y):
-            n = len(y) // 10 if len(y) // 10 > 0 else len(y)
-            t_samples = np.arange(n)
-            plt.plot(t_samples, y[:n], label='Waveform', linewidth=0.8)
-        plt.axhline(y=0.1, color='green', linestyle='--', label='Ideal Loudness Upper (~0.1)')
-        plt.axhline(y=-0.1, color='green', linestyle='--', label='Ideal Loudness Lower (~-0.1)')
-        plt.title('Audio Waveform (Zoomed) with Ideal Loudness Zones')
-        plt.xlabel('Samples')
-        plt.ylabel('Amplitude')
-        plt.legend()
+        fig1, ax1 = plt.subplots(figsize=(10, 5))
+        bars = ax1.bar(metrics, relative_values, color=colors)
+        ax1.axhline(y=1.0, color='b', linestyle='--', label='Ideal Level')
+        ax1.set_title('Voice Characteristics vs. Ideal Benchmarks (Relative)')
+        ax1.set_ylabel('Relative Performance (Ideal = 1.0)')
+        ax1.legend()
+        ax1.grid(axis='y', linestyle='--', alpha=0.7)
+        performance_plot_path = os.path.join(temp_dir, "performance_plot.png")
+        plt.tight_layout()
+        plt.savefig(performance_plot_path)
+        plt.close()
 
-        # Bottom plot: spectrogram
-        plt.subplot(2, 1, 2)
-        if len(y):
-            D = librosa.amplitude_to_db(np.abs(librosa.stft(y)), ref=np.max)
-            librosa.display.specshow(D, y_axis='linear', x_axis='time', sr=sr)
-            plt.colorbar(format='%+2.0f dB')
-            plt.axhline(y=100, color='orange', linestyle='--', label='Ideal Freq Lower (~100 Hz)')
-            plt.axhline(y=300, color='orange', linestyle='--', label='Ideal Freq Upper (~300 Hz)')
-        plt.title('Spectrogram with Ideal Frequency Zones')
-        plt.xlabel('Time (s)')
-        plt.ylabel('Frequency (Hz)')
-        plt.legend()
-        tech_plot_png = _save_plot_to_png_bytes()
+        # Technical Plot: Waveform + Spectrogram
+        fig2, axes = plt.subplots(2, 1, figsize=(12, 8))
 
-        # 5) Summary/insights
-        pitch_status = "High (excited/stressed)" if pitch_mean > typical_pitch_range * 1.5 else \
-                       "Normal" if pitch_mean > typical_pitch_range * 0.8 else \
-                       "Low (calm/monotone)"
-        energy_status = "Low (monotone)" if energy < ideal_energy_range * 0.5 else \
-                        "Normal" if energy < ideal_energy_range * 1.5 else \
-                        "High (energetic)"
-        rate_status = "Slow (hesitant)" if speaking_rate < typical_speaking_rate * 0.5 else \
-                      "Normal" if speaking_rate < typical_speaking_rate * 1.2 else \
-                      "Fast (rushed)"
+        # Waveform
+        axes[0].plot(y[:len(y)//10], label='Waveform', color='blue')
+        axes[0].axhline(y=0.1, color='green', linestyle='--', label='Ideal Loudness Upper (~0.1)')
+        axes[0].axhline(y=-0.1, color='green', linestyle='--', label='Ideal Loudness Lower (~-0.1)')
+        axes[0].set_title('Audio Waveform with Ideal Loudness Zones')
+        axes[0].set_xlabel('Time (samples)')
+        axes[0].set_ylabel('Amplitude')
+        axes[0].legend()
+        axes[0].grid(True)
 
+        # Spectrogram
+        D = librosa.amplitude_to_db(np.abs(librosa.stft(y)), ref=np.max)
+        img = librosa.display.specshow(D, y_axis='linear', x_axis='time', sr=sr, ax=axes[1])
+        fig2.colorbar(img, ax=axes[1], format='%+2.0f dB')
+        axes[1].axhline(y=100, color='orange', linestyle='--', label='Ideal Freq Lower (~100 Hz)')
+        axes[1].axhline(y=300, color='orange', linestyle='--', label='Ideal Freq Upper (~300 Hz)')
+        axes[1].set_title('Spectrogram with Ideal Frequency Zones')
+        axes[1].set_xlabel('Time (s)')
+        axes[1].set_ylabel('Frequency (Hz)')
+        axes[1].legend()
+        tech_plot_path = os.path.join(temp_dir, "tech.png")
+        plt.tight_layout()
+        plt.savefig(tech_plot_path)
+        plt.close()
+
+        # Step 5: Summary report
+        pitch_status = "High (excited/stressed)" if pitch_mean > typical_pitch_range * 1.5 else "Normal" if pitch_mean > typical_pitch_range * 0.8 else "Low (calm/monotone)"
+        energy_status = "Low (monotone)" if energy < ideal_energy_range * 0.5 else "Normal" if energy < ideal_energy_range * 1.5 else "High (energetic)"
+        rate_status = "Slow (hesitant)" if speaking_rate < typical_speaking_rate * 0.5 else "Normal" if speaking_rate < typical_speaking_rate * 1.2 else "Fast (rushed)"
         recommendations = (
             f"- Increase pitch variation for engagement if {pitch_status}.\n"
             f"- Boost energy with louder delivery if {energy_status}.\n"
-            f"- Adjust pace to ~{int(typical_speaking_rate)} wpm if {rate_status}.\n"
+            f"- Adjust pace to {typical_speaking_rate} wpm if {rate_status}.\n"
             f"- Reduce pauses ({pause_frequency:.1f}/min) for smoother flow if frequent."
         )
 
@@ -250,68 +180,51 @@ def analyze_audio_from_video(uploaded_file) -> dict:
             f"- Energy Level: {energy:.2f} - {energy_status}\n"
             f"- Speaking Rate: {speaking_rate:.1f} wpm - {rate_status}\n"
             f"- Pause Frequency: {pause_frequency:.1f} pauses/min\n"
-            f"- Delivery Effectiveness Index: {effectiveness_index:.1f}/100\n\n"
+            f"- Delivery Effectiveness Index: {effectiveness_index:.1f}/100\n"
             f"Business Insights:\n"
-            f"This delivery may struggle to engage audiences due to {energy_status.lower()} energy "
-            f"and {rate_status.lower()} pace.\n\n"
+            f"This delivery may struggle to engage audiences due to {energy_status.lower()} energy and {rate_status.lower()} pace.\n"
             f"Recommendations:\n{recommendations}"
         )
 
-        return {
-            "clip_stats": clip_stats,
-            "summary": summary,
-            "performance_plot_png": performance_plot_png.getvalue(),
-            "extremes_table_df": extremes_table,
-            "tech_plot_png": tech_plot_png.getvalue(),
-        }
+        return clip_stats, summary, performance_plot_path, extremes_table, tech_plot_path
 
+    except Exception as e:
+        return f"Error: {str(e)}", "", None, None, None
+    finally:
+        # Cleanup not done here — we'll clean up after Streamlit renders
+        pass
 
-# ---------- Streamlit UI ----------
+# File uploader
+uploaded_video = st.file_uploader("📤 Upload Video (MP4)", type=["mp4"])
 
-st.title("🎙️ Audio Voice Sample Analyzer")
-st.markdown("Upload a video to extract and analyze its audio voice characteristics. Ideal for calls, pitches, or podcasts.")
+if uploaded_video is not None:
+    with st.spinner("Analyzing audio... This may take a minute."):
+        clip_stats, summary, perf_plot, extremes_df, tech_plot = analyze_audio_from_video(uploaded_video)
 
-tab_input, tab_analysis, tab_tech = st.tabs(["Input", "Voice Analysis", "Technical Analysis"])
+    # Display results in tabs
+    tab1, tab2, tab3 = st.tabs(["📋 Clip Stats & Summary", "📊 Voice Analysis", "🔬 Technical Analysis"])
 
-with tab_input:
-    uploaded_video = st.file_uploader("Upload Video (MP4)", type=["mp4"], accept_multiple_files=False)
-    analyze_clicked = st.button("Analyze Audio")
+    with tab1:
+        st.subheader("Clip Statistics")
+        st.text(clip_stats)
+        st.subheader("Analysis Summary")
+        st.text_area("Voice Analysis Summary", summary, height=300)
 
-    if analyze_clicked:
-        if uploaded_video is None:
-            st.warning("Please upload an MP4 file first.")
-        else:
-            with st.spinner("Extracting audio and analyzing…"):
-                try:
-                    results = analyze_audio_from_video(uploaded_video)
-                    # Store in session state so other tabs can read
-                    st.session_state["analysis_results"] = results
-                    st.success("Analysis complete!")
-                except Exception as e:
-                    st.error(f"Error: {e}")
+    with tab2:
+        col1, col2 = st.columns([2, 1])
+        with col1:
+            if perf_plot and os.path.exists(perf_plot):
+                st.image(perf_plot, caption="Performance vs. Benchmarks", use_column_width=True)
+        with col2:
+            if extremes_df is not None:
+                st.write("### Extreme Attribute Timestamps")
+                st.dataframe(extremes_df, use_container_width=True)
 
-    # Show clip stats right away if available
-    if "analysis_results" in st.session_state:
-        st.text_area("Clip Statistics", st.session_state["analysis_results"]["clip_stats"], height=100)
+    with tab3:
+        if tech_plot and os.path.exists(tech_plot):
+            st.image(tech_plot, caption="Waveform and Spectrogram with Ideal Zones", use_column_width=True)
 
-with tab_analysis:
-    if "analysis_results" not in st.session_state:
-        st.info("Run an analysis in the **Input** tab to see results here.")
-    else:
-        res = st.session_state["analysis_results"]
-        st.text_area("Voice Analysis Summary", res["summary"], height=300)
-
-        st.subheader("Performance vs. Benchmarks")
-        st.image(res["performance_plot_png"], caption="Relative performance (Ideal = 1.0).", use_column_width=True)
-
-        st.subheader("Extreme Attribute Timestamps")
-        st.dataframe(res["extremes_table_df"], use_container_width=True)
-
-with tab_tech:
-    if "analysis_results" not in st.session_state:
-        st.info("Run an analysis in the **Input** tab to see results here.")
-    else:
-        res = st.session_state["analysis_results"]
-        st.image(res["tech_plot_png"], caption="Waveform (zoom) and Spectrogram with ideal zones.", use_column_width=True)
-
-st.caption("Note: Pitch/energy/rate heuristics are approximate and context-dependent.")
+# Cleanup after rendering (optional, Streamlit temp files are usually cleaned automatically)
+# Uncomment if you want explicit cleanup
+# if os.path.exists(temp_dir):
+#     shutil.rmtree(temp_dir)
