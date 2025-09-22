@@ -3,4 +3,4 @@ librosa
 matplotlib
 numpy
 pandas
-ffmpeg-python
+imageio-ffmpeg
