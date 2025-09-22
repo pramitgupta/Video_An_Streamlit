@@ -4,9 +4,11 @@ import numpy as np
 import matplotlib.pyplot as plt
 import os
 import shutil
-from pathlib import Path
 import pandas as pd
 import subprocess
+
+# Import imageio-ffmpeg to ensure ffmpeg is available
+import imageio_ffmpeg
 
 # Set page config
 st.set_page_config(page_title="Audio Voice Sample Analyzer", layout="wide")
@@ -18,6 +20,10 @@ st.markdown("Upload a video to extract and analyze its audio voice characteristi
 temp_dir = "temp"
 os.makedirs(temp_dir, exist_ok=True)
 
+def get_ffmpeg_exe():
+    """Get path to ffmpeg executable from imageio-ffmpeg"""
+    return imageio_ffmpeg.get_ffmpeg_exe()
+
 def analyze_audio_from_video(video_file):
     try:
         # Set up paths
@@ -28,17 +34,19 @@ def analyze_audio_from_video(video_file):
         with open(video_path, "wb") as f:
             f.write(video_file.read())
 
-        # Step 1: Extract audio from video and get clip stats
+        ffmpeg_exe = get_ffmpeg_exe()
+
+        # Step 1: Extract audio from video
         result = subprocess.run(
-            ['ffmpeg', '-i', video_path, '-vn', '-acodec', 'pcm_s16le', audio_path],
+            [ffmpeg_exe, '-i', video_path, '-vn', '-acodec', 'pcm_s16le', '-ar', '22050', '-y', audio_path],
             capture_output=True, text=True
         )
         if result.returncode != 0:
-            raise Exception(f"FFmpeg error: {result.stderr}")
+            raise Exception(f"FFmpeg error during audio extraction: {result.stderr}")
 
-        # Get video duration and size
+        # Get video duration
         probe = subprocess.run(
-            ['ffprobe', '-v', 'error', '-show_entries', 'format=duration',
+            [ffmpeg_exe, '-v', 'error', '-show_entries', 'format=duration',
              '-of', 'default=noprint_wrappers=1:nokey=1', video_path],
             text=True, capture_output=True
         )
@@ -51,8 +59,8 @@ def analyze_audio_from_video(video_file):
             size_unit = "MB"
         clip_stats = f"Clip Statistics:\n- Duration: {int(minutes)}m {int(seconds)}s\n- File Size: {file_size:.2f} {size_unit}"
 
-        # Step 2: Analyze audio features
-        y, sr = librosa.load(audio_path)
+        # Step 2: Load audio with librosa
+        y, sr = librosa.load(audio_path, sr=None)  # Preserve original sample rate
         duration_sec = len(y) / sr
 
         # Pitch analysis
@@ -66,7 +74,7 @@ def analyze_audio_from_video(video_file):
         energy = np.mean(librosa.feature.rms(y=y)[0])
         ideal_energy_range = 0.15
 
-        # Speaking rate (approximation)
+        # Speaking rate (approximation using splits)
         silent_intervals = librosa.effects.split(y, top_db=20)
         speaking_rate = len(silent_intervals) / duration_sec * 60 if duration_sec > 0 else 0
         typical_speaking_rate = 120
@@ -84,24 +92,31 @@ def analyze_audio_from_video(video_file):
         # Step 3: Find extreme attributes with timestamps
         time_points = np.linspace(0, duration_sec, len(y))
 
+        # Max amplitude
         max_amp_idx = np.argmax(np.abs(y))
         max_amp_time = time_points[max_amp_idx]
         max_amp_val = y[max_amp_idx]
 
+        # Min amplitude (closest to zero)
         min_amp_idx = np.argmin(np.abs(y))
         min_amp_time = time_points[min_amp_idx]
         min_amp_val = y[min_amp_idx]
 
         # Max pitch
-        max_pitch_idx = np.unravel_index(np.argmax(pitch), pitch.shape)[1] if pitch.size > 0 else 0
-        max_pitch_time = time_points[max_pitch_idx] if max_pitch_idx < len(time_points) else 0
-        max_pitch_val = np.max(pitch) if pitch.size > 0 else 0
+        if pitch.size > 0:
+            frame_idx = np.argmax(np.max(pitch, axis=0))  # Best frame with max pitch
+            max_pitch_time = time_points[frame_idx] if frame_idx < len(time_points) else 0
+            max_pitch_val = np.max(pitch[:, frame_idx])
+        else:
+            max_pitch_time = 0
+            max_pitch_val = 0
 
         # Min pitch (excluding silence)
         valid_pitch = pitch[pitch > 0]
         if valid_pitch.size > 0:
-            min_pitch_idx = np.unravel_index(np.argmin(pitch), pitch.shape)[1]
-            min_pitch_time = time_points[min_pitch_idx] if min_pitch_idx < len(time_points) else 0
+            # Find frame with minimum pitch
+            frame_idx = np.argmin(np.min(pitch + (pitch == 0) * 1e6, axis=0))  # ignore 0s
+            min_pitch_time = time_points[frame_idx] if frame_idx < len(time_points) else 0
             min_pitch_val = np.min(valid_pitch)
         else:
             min_pitch_time = 0
@@ -138,8 +153,9 @@ def analyze_audio_from_video(video_file):
         # Technical Plot: Waveform + Spectrogram
         fig2, axes = plt.subplots(2, 1, figsize=(12, 8))
 
-        # Waveform
-        axes[0].plot(y[:len(y)//10], label='Waveform', color='blue')
+        # Waveform (first 10% of samples for clarity)
+        sample_limit = len(y) // 10
+        axes[0].plot(range(sample_limit), y[:sample_limit], label='Waveform', color='blue')
         axes[0].axhline(y=0.1, color='green', linestyle='--', label='Ideal Loudness Upper (~0.1)')
         axes[0].axhline(y=-0.1, color='green', linestyle='--', label='Ideal Loudness Lower (~-0.1)')
         axes[0].set_title('Audio Waveform with Ideal Loudness Zones')
@@ -150,7 +166,7 @@ def analyze_audio_from_video(video_file):
 
         # Spectrogram
         D = librosa.amplitude_to_db(np.abs(librosa.stft(y)), ref=np.max)
-        img = librosa.display.specshow(D, y_axis='linear', x_axis='time', sr=sr, ax=axes[1])
+        img = librosa.display.specshow(D, sr=sr, x_axis='time', y_axis='linear', ax=axes[1])
         fig2.colorbar(img, ax=axes[1], format='%+2.0f dB')
         axes[1].axhline(y=100, color='orange', linestyle='--', label='Ideal Freq Lower (~100 Hz)')
         axes[1].axhline(y=300, color='orange', linestyle='--', label='Ideal Freq Upper (~300 Hz)')
@@ -189,42 +205,51 @@ def analyze_audio_from_video(video_file):
         return clip_stats, summary, performance_plot_path, extremes_table, tech_plot_path
 
     except Exception as e:
-        return f"Error: {str(e)}", "", None, None, None
+        error_msg = f"Error: {str(e)}"
+        st.error(error_msg)
+        return error_msg, "", None, None, None
     finally:
-        # Cleanup not done here — we'll clean up after Streamlit renders
-        pass
+        pass  # Cleanup handled after render if needed
 
 # File uploader
 uploaded_video = st.file_uploader("📤 Upload Video (MP4)", type=["mp4"])
 
 if uploaded_video is not None:
-    with st.spinner("Analyzing audio... This may take a minute."):
+    with st.spinner("⏳ Analyzing audio... This may take a minute."):
         clip_stats, summary, perf_plot, extremes_df, tech_plot = analyze_audio_from_video(uploaded_video)
 
-    # Display results in tabs
-    tab1, tab2, tab3 = st.tabs(["📋 Clip Stats & Summary", "📊 Voice Analysis", "🔬 Technical Analysis"])
+    if "Error:" in clip_stats:
+        st.error(clip_stats)
+    else:
+        # Display results in tabs
+        tab1, tab2, tab3 = st.tabs(["📋 Clip Stats & Summary", "📊 Voice Analysis", "🔬 Technical Analysis"])
 
-    with tab1:
-        st.subheader("Clip Statistics")
-        st.text(clip_stats)
-        st.subheader("Analysis Summary")
-        st.text_area("Voice Analysis Summary", summary, height=300)
+        with tab1:
+            st.subheader("📹 Clip Statistics")
+            st.text(clip_stats)
+            st.subheader("📝 Analysis Summary")
+            st.text_area("Voice Analysis Summary", summary, height=350)
 
-    with tab2:
-        col1, col2 = st.columns([2, 1])
-        with col1:
-            if perf_plot and os.path.exists(perf_plot):
-                st.image(perf_plot, caption="Performance vs. Benchmarks", use_column_width=True)
-        with col2:
-            if extremes_df is not None:
-                st.write("### Extreme Attribute Timestamps")
-                st.dataframe(extremes_df, use_container_width=True)
+        with tab2:
+            col1, col2 = st.columns([2, 1])
+            with col1:
+                if perf_plot and os.path.exists(perf_plot):
+                    st.image(perf_plot, caption="📈 Performance vs. Benchmarks", use_column_width=True)
+                else:
+                    st.warning("Performance plot not generated.")
+            with col2:
+                if extremes_df is not None:
+                    st.write("### ⏱️ Extreme Attribute Timestamps")
+                    st.dataframe(extremes_df, use_container_width=True)
+                else:
+                    st.warning("Extremes table not available.")
 
-    with tab3:
-        if tech_plot and os.path.exists(tech_plot):
-            st.image(tech_plot, caption="Waveform and Spectrogram with Ideal Zones", use_column_width=True)
+        with tab3:
+            if tech_plot and os.path.exists(tech_plot):
+                st.image(tech_plot, caption="📉 Waveform and Spectrogram with Ideal Zones", use_column_width=True)
+            else:
+                st.warning("Technical plot not generated.")
 
-# Cleanup after rendering (optional, Streamlit temp files are usually cleaned automatically)
-# Uncomment if you want explicit cleanup
+# Optional cleanup (uncomment if needed)
 # if os.path.exists(temp_dir):
 #     shutil.rmtree(temp_dir)
