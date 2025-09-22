@@ -3,5 +3,4 @@ librosa
 matplotlib
 numpy
 pandas
-tqdm
-soundfile
+ffmpeg-python
