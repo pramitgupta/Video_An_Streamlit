@@ -1,0 +1,21 @@
+# Core app
+streamlit>=1.33
+
+# Numerics & plotting
+numpy==1.26.4
+scipy==1.11.4
+pandas==2.2.2
+matplotlib==3.8.4
+
+# Audio
+librosa==0.10.1
+soundfile==0.12.1
+tqdm==4.66.4
+
+# Video / image
+opencv-python-headless==4.9.0.80
+imageio-ffmpeg==0.4.9
+
+# Face + emotion (DeepFace uses TensorFlow)
+deepface==0.0.93
+tensorflow-cpu==2.16.1
